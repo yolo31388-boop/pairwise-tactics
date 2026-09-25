@@ -2,10 +2,10 @@
 
 核心不变量：
 - 移动范围用 BFS 按地形消耗扩展，障碍物不可通行
-- 机会攻击在离开威胁格时触发，每敌方单位每回合一次
-- 地形消耗按进入格计算
+- 机会攻击在离开敌方威胁格时触发，每个敌方单位每回合最多触发一次
+- 地形消耗按进入格计算；多种地形效果加性叠加，进入格消耗下限为 1
 - 攻击范围基于当前所在格
-- 单位不能穿过其他单位
+- 单位不能穿过其他单位（拥有 can_pass_through 技能的单位可穿过，但不能停在被占据格）
 - 相同配置结果确定
 """
 
@@ -27,15 +27,19 @@ class Unit:
     pos: Tuple[int, int]
     team: str = "player"
     has_moved: bool = False
+    can_pass_through: bool = False  # 特殊技能：可穿过其他单位（但不能停在其格子上）
     opportunity_used: Set[str] = field(default_factory=set)  # 本回合已触发机会攻击的目标 uid
 
 
 class TacticsEngine:
+    _DIRECTIONS: Tuple[Tuple[int, int], ...] = ((-1, 0), (1, 0), (0, -1), (0, 1))
+
     def __init__(self, width: int = 8, height: int = 8):
         self.width = width
         self.height = height
         self.obstacles: Set[Tuple[int, int]] = set()
-        self.terrain: Dict[Tuple[int, int], int] = {}  # pos -> 移动消耗（默认1）
+        self.terrain: Dict[Tuple[int, int], int] = {}  # pos -> 基础移动消耗（默认1）
+        self.terrain_effects: Dict[Tuple[int, int], List[int]] = {}  # pos -> 附加地形效果列表
         self.units: List[Unit] = []
         self.turn = 0
 
@@ -44,6 +48,10 @@ class TacticsEngine:
 
     def set_terrain(self, x: int, y: int, cost: int) -> None:
         self.terrain[(x, y)] = cost
+
+    def add_terrain_effect(self, x: int, y: int, modifier: int) -> None:
+        """在格子上叠加一个地形效果（加性，可为负）。"""
+        self.terrain_effects.setdefault((x, y), []).append(modifier)
 
     def add_unit(self, u: Unit) -> None:
         self.units.append(u)
@@ -61,32 +69,41 @@ class TacticsEngine:
         return None
 
     def _terrain_cost(self, pos: Tuple[int, int]) -> int:
-        return self.terrain.get(pos, 1)
+        """进入格消耗 = 基础消耗 + 所有附加效果之和，下限为 1。"""
+        base = self.terrain.get(pos, 1)
+        extra = sum(self.terrain_effects.get(pos, ()))
+        return max(1, base + extra)
 
     def reachable_cells(self, unit: Unit) -> Dict[Tuple[int, int], int]:
-        """BFS 计算可达格子及最小消耗。BUG：漏掉右方向扩展。"""
+        """BFS 从起点按进入格地形消耗扩展，返回可达格子及最小消耗。
+
+        障碍物完全不可通行；其他单位占据的格子不可通行（拥有
+        can_pass_through 技能时可穿过但不能停留）；剩余移动力不足以
+        进入的格子不可达。
+        """
         start = unit.pos
         dist = {start: 0}
         q = deque([start])
-        # BUG: 只检查了上、下、左，漏掉了右方向 (1, 0)
-        directions = [(-1, 0), (1, 0), (0, -1)]  # 应该是 [(-1,0),(1,0),(0,-1),(0,1)]
         while q:
             x, y = q.popleft()
             d = dist[(x, y)]
-            for dx, dy in directions:
+            for dx, dy in self._DIRECTIONS:
                 nx, ny = x + dx, y + dy
                 if not (0 <= nx < self.width and 0 <= ny < self.height):
                     continue
                 if (nx, ny) in self.obstacles:
                     continue
-                if self._unit_at((nx, ny)) and (nx, ny) != start:
+                occupant = self._unit_at((nx, ny))
+                if occupant is not None and (nx, ny) != start and not unit.can_pass_through:
                     continue  # 不能穿过其他单位
                 cost = self._terrain_cost((nx, ny))
                 nd = d + cost
                 if nd <= unit.move and (nd < dist.get((nx, ny), float("inf"))):
                     dist[(nx, ny)] = nd
                     q.append((nx, ny))
-        return dist
+        # 不能停在其他单位占据的格子上
+        return {pos: d for pos, d in dist.items()
+                if pos == start or self._unit_at(pos) is None}
 
     def can_reach(self, unit: Unit, target: Tuple[int, int]) -> bool:
         return target in self.reachable_cells(unit)
@@ -106,15 +123,15 @@ class TacticsEngine:
     def move(self, unit: Unit, target: Tuple[int, int]) -> bool:
         if not self.can_reach(unit, target):
             return False
-        # 检查机会攻击：离开敌方威胁格时触发
+        # 检查机会攻击：离开敌方威胁格时触发，每个敌方单位每回合最多一次
         for enemy in self.units:
             if enemy.team == unit.team or enemy.hp <= 0:
                 continue
-            if unit.uid in enemy.opportunity_used:
+            if enemy.opportunity_used:
                 continue
             edx = abs(enemy.pos[0] - unit.pos[0])
             edy = abs(enemy.pos[1] - unit.pos[1])
-            if edx + edy <= 1:  # 相邻即威胁
+            if edx + edy <= enemy.attack_range:  # 处于敌方威胁范围内
                 enemy.opportunity_used.add(unit.uid)
                 unit.hp -= enemy.atk
                 if unit.hp <= 0:
