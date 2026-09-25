@@ -3,7 +3,9 @@
 核心不变量：
 - 移动范围用 BFS 按地形消耗扩展，障碍物不可通行
 - 机会攻击在离开威胁格时触发，每敌方单位每回合一次
-- 地形消耗按进入格计算
+- 地形消耗按进入格计算；多种地形效果叠加规则为：
+  进入格消耗 = 基础地形消耗（set_terrain 设置，默认 1）+ 所有附加地形效果之和，
+  结果下限为 0
 - 攻击范围基于当前所在格
 - 单位不能穿过其他单位
 - 相同配置结果确定
@@ -36,6 +38,7 @@ class TacticsEngine:
         self.height = height
         self.obstacles: Set[Tuple[int, int]] = set()
         self.terrain: Dict[Tuple[int, int], int] = {}  # pos -> 移动消耗（默认1）
+        self.terrain_effects: Dict[Tuple[int, int], List[int]] = {}  # pos -> 附加消耗修正列表
         self.units: List[Unit] = []
         self.turn = 0
 
@@ -44,6 +47,10 @@ class TacticsEngine:
 
     def set_terrain(self, x: int, y: int, cost: int) -> None:
         self.terrain[(x, y)] = cost
+
+    def add_terrain_effect(self, x: int, y: int, cost: int) -> None:
+        """给格子叠加一个附加地形消耗修正（可为负），与基础消耗相加。"""
+        self.terrain_effects.setdefault((x, y), []).append(cost)
 
     def add_unit(self, u: Unit) -> None:
         self.units.append(u)
@@ -61,15 +68,16 @@ class TacticsEngine:
         return None
 
     def _terrain_cost(self, pos: Tuple[int, int]) -> int:
-        return self.terrain.get(pos, 1)
+        base = self.terrain.get(pos, 1)
+        extra = sum(self.terrain_effects.get(pos, ()))
+        return max(0, base + extra)
 
     def reachable_cells(self, unit: Unit) -> Dict[Tuple[int, int], int]:
-        """BFS 计算可达格子及最小消耗。BUG：漏掉右方向扩展。"""
+        """BFS 计算可达格子及最小消耗。"""
         start = unit.pos
         dist = {start: 0}
         q = deque([start])
-        # BUG: 只检查了上、下、左，漏掉了右方向 (1, 0)
-        directions = [(-1, 0), (1, 0), (0, -1)]  # 应该是 [(-1,0),(1,0),(0,-1),(0,1)]
+        directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
         while q:
             x, y = q.popleft()
             d = dist[(x, y)]
@@ -106,7 +114,8 @@ class TacticsEngine:
     def move(self, unit: Unit, target: Tuple[int, int]) -> bool:
         if not self.can_reach(unit, target):
             return False
-        # 检查机会攻击：离开敌方威胁格时触发
+        # 检查机会攻击：离开敌方威胁格（敌方攻击范围内）时触发，
+        # 每个敌方单位每回合对同一目标只触发一次
         for enemy in self.units:
             if enemy.team == unit.team or enemy.hp <= 0:
                 continue
@@ -114,7 +123,7 @@ class TacticsEngine:
                 continue
             edx = abs(enemy.pos[0] - unit.pos[0])
             edy = abs(enemy.pos[1] - unit.pos[1])
-            if edx + edy <= 1:  # 相邻即威胁
+            if edx + edy <= enemy.attack_range:
                 enemy.opportunity_used.add(unit.uid)
                 unit.hp -= enemy.atk
                 if unit.hp <= 0:
